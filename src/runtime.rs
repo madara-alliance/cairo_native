@@ -31,6 +31,11 @@ use std::{
     mem::ManuallyDrop,
     os::fd::FromRawFd,
     ptr::{self, null_mut},
+
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        LazyLock,
+    },
 };
 use std::{ops::Mul, vec::IntoIter};
 
@@ -171,6 +176,41 @@ lazy_static! {
         (DICT_SQUASH_UNIQUE_KEY_COST.cost() - DICT_SQUASH_REPEATED_ACCESS_COST.cost()) as u64;
 }
 
+const PEDERSEN_CACHE_CAPACITY: usize = 8 * 1024;
+static PEDERSEN_CACHE_ENABLED: LazyLock<AtomicBool> = LazyLock::new(|| {
+    let enabled = std::env::var("CAIRO_NATIVE_PEDERSEN_CACHE").is_ok_and(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    });
+    AtomicBool::new(enabled)
+});
+
+fn pedersen_cache_enabled() -> bool {
+    PEDERSEN_CACHE_ENABLED.load(Ordering::Relaxed)
+}
+
+fn pedersen_cache_get(lhs: Felt, rhs: Felt) -> Option<Felt> {
+    if !pedersen_cache_enabled() {
+        return None;
+    }
+    PEDERSEN_CACHE.with(|cache| cache.borrow().get(&(lhs, rhs)).copied())
+}
+
+fn pedersen_cache_insert(lhs: Felt, rhs: Felt, result: Felt) {
+    if !pedersen_cache_enabled() {
+        return;
+    }
+    PEDERSEN_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= PEDERSEN_CACHE_CAPACITY {
+            cache.clear();
+        }
+        cache.insert((lhs, rhs), result);
+    });
+}
+
 /// Based on `cairo-lang-runner`'s implementation.
 ///
 /// Source: <https://github.com/starkware-libs/cairo/blob/main/crates/cairo-lang-runner/src/casm_run/mod.rs#L1946-L1948>
@@ -235,7 +275,11 @@ pub unsafe extern "C" fn cairo_native__libfunc__pedersen(
     let rhs = Felt::from_bytes_le(&rhs);
 
     // Compute pedersen hash and copy the result into `dst`.
-    let res = starknet_types_core::hash::Pedersen::hash(&lhs, &rhs);
+    let res = pedersen_cache_get(lhs, rhs).unwrap_or_else(|| {
+        let result = starknet_types_core::hash::Pedersen::hash(&lhs, &rhs);
+        pedersen_cache_insert(lhs, rhs, result);
+        result
+    });
     *dst = res.to_bytes_le();
 }
 
@@ -795,6 +839,8 @@ pub unsafe extern "C" fn cairo_native__libfunc__qm31__qm31_div(
 }
 
 thread_local! {
+    static PEDERSEN_CACHE: RefCell<HashMap<(Felt, Felt), Felt>> = RefCell::new(HashMap::new());
+
     pub(crate) static BUILTIN_COSTS: Cell<BuiltinCosts> = const {
         // These default values shouldn't be accessible, they will be overriden before entering
         // compiled code.
@@ -1138,6 +1184,25 @@ mod tests {
                 236, 0, 205, 134, 200, 185, 39, 92, 0, 228, 132, 217, 130, 5
             ]
         )
+    }
+
+    #[test]
+    fn pedersen_cache_is_opt_in() {
+        let lhs = Felt::from(1);
+        let rhs = Felt::from(3);
+        let expected = starknet_types_core::hash::Pedersen::hash(&lhs, &rhs);
+
+        PEDERSEN_CACHE_ENABLED.store(false, Ordering::Relaxed);
+        PEDERSEN_CACHE.with(|cache| cache.borrow_mut().clear());
+        pedersen_cache_insert(lhs, rhs, expected);
+        assert_eq!(pedersen_cache_get(lhs, rhs), None);
+
+        PEDERSEN_CACHE_ENABLED.store(true, Ordering::Relaxed);
+        pedersen_cache_insert(lhs, rhs, expected);
+        assert_eq!(pedersen_cache_get(lhs, rhs), Some(expected));
+
+        PEDERSEN_CACHE_ENABLED.store(false, Ordering::Relaxed);
+        PEDERSEN_CACHE.with(|cache| cache.borrow_mut().clear());
     }
 
     #[test]
